@@ -11,13 +11,16 @@ MODIS Aqua/Terra MAIAC BRF Documentation:
     https://lpdaac.usgs.gov/products/mcd19a1v006/
     https://lpdaac.usgs.gov/documents/110/MCD19_User_Guide_V6.pdf
 
+MODIS Sinusoidal Grids:
+    https://modis-land.gsfc.nasa.gov/MODLAND_grid.html
+
 COMMAND LINE OPTIONS:
     --help: list the command line options
     -U X, --user X: username for NASA Earthdata Login
     -N X, --netrc X: path to .netrc file for alternative authentication
     -Y X, --year X: years to run
     -D X, --directory X: working data directory
-    -B X, --bounds X: Grid Bounds (xmin,xmax,ymin,ymax)
+    -B X, --bounds X: Grid Bounds (xmin,ymin,xmax,ymax)
     -S X, --spacing X: Grid Spacing (dx,dy)
     -P X, --projection X: Grid spatial projection (EPSG code or PROJ4 code)
     -V, --verbose: Verbose output of processing run
@@ -60,6 +63,55 @@ def modis_snow_grain_mosaic(DIRECTORY, YEARS=None, BOUNDS=None, SPACING=None,
     """
     Create daily mosaics of snow grain size from MODIS imagery
     """
+    # projection for output mosaic
+    # attempt to use EPSG code and fall back on PROJ4 code
+    try:
+        crs1 = pyproj.CRS.from_string("epsg:{0:d}".format(int(PROJECTION)))
+    except (ValueError,pyproj.exceptions.CRSError):
+        crs1 = pyproj.CRS.from_string(PROJECTION)
+    crs2 = pyproj.CRS.from_string("epsg:{0:d}".format(4326))
+    # create transformer for converting from latitude/longitude to projection
+    transformer = pyproj.Transformer.from_crs(crs2, crs1, always_xy=True)
+    # output projection for geotiff
+    wkt = crs1.to_wkt()
+
+    # create X and Y arrays
+    xi = np.arange(BOUNDS[0],BOUNDS[2]+SPACING[0],SPACING[0])
+    yi = np.arange(BOUNDS[3],BOUNDS[1]-SPACING[1],-SPACING[1])
+    # grid dimensions
+    nx = len(xi)
+    ny = len(yi)
+    # output geotranform for geotiffs
+    geotransform = [BOUNDS[0],SPACING[0],0,BOUNDS[3],0,-SPACING[1]]
+
+    # create shapely object of output grid bounds
+    bounds_grid = np.array([[BOUNDS[0],BOUNDS[1]], [BOUNDS[2],BOUNDS[1]],
+        [BOUNDS[2],BOUNDS[3]], [BOUNDS[0],BOUNDS[3]], [BOUNDS[0],BOUNDS[1]]])
+    bounds_poly = shapely.geometry.Polygon(bounds_grid)
+
+    # determine MODIS Sinusoidal tiles to read
+    tiles = snow_grains.utilities.get_data_path(['data','sn_bound_10deg.txt'])
+    tile_dtype = dict(names=('iv','ih','lon_min','lon_max','lat_min','lat_max'),
+        formats=('i','i','f','f','f','f'))
+    tile_input = np.loadtxt(tiles,skiprows=7,max_rows=649,dtype=tile_dtype)
+    # valid vertical and horizontal tiles
+    valid_tiles = []
+    # for each MODIS Sinusoidal tile
+    for tile in tile_input:
+        # create tile
+        tile_grid = np.array([[tile['lon_min'],tile['lat_min']],
+            [tile['lon_max'],tile['lat_min']],
+            [tile['lon_max'],tile['lat_max']],
+            [tile['lon_min'],tile['lat_max']],
+            [tile['lon_min'],tile['lat_min']]])
+        # convert tile coordinates to projection
+        xtile,ytile = transformer.transform(tile_grid[:,0],tile_grid[:,1])
+        tile_poly = shapely.geometry.Polygon(np.c_[xtile,ytile])
+        if tile_poly.intersects(bounds_poly):
+            valid_tiles.append('h{0:02d}v{0:02d}'.format(tile['ih'],tile['iv']))
+    # create tile regex pattern for files
+    file_pattern = '(' + '|'.join(valid_tiles) + ')'
+
     # server archive and opendap url with MODIS data
     HOST = ['https://ladsweb.modaps.eosdis.nasa.gov','archive','allData','6']
     OPENDAP = ['https://ladsweb.modaps.eosdis.nasa.gov','opendap','allData','6']
@@ -71,22 +123,76 @@ def modis_snow_grain_mosaic(DIRECTORY, YEARS=None, BOUNDS=None, SPACING=None,
     remote_years,_ = snow_grains.utilities.lpdaac_list([*HOST,'MCD19A1.json'],
         build=False, pattern=pattern, sort=True)
     # for each year of interest
-    for Y in remote_years:
+    for YR in remote_years:
         # find available days of the year
-        URL = [*HOST,'MCD19A1','{0}.json'.format(Y)]
+        URL = [*HOST,'MCD19A1','{0}.json'.format(YR)]
         remote_days,_ = snow_grains.utilities.lpdaac_list(URL,
             build=False, pattern='\d+', sort=True)
         # build a mosaic for each day of the year
         for D in remote_days:
-            URL = [*HOST,'MCD19A1',Y,'{0}.json'.format(D)]
-            files,lastmod = snow_grains.utilities.lpdaac_list(URL, build=False)
+            URL = [*HOST,'MCD19A1',YR,'{0}.json'.format(D)]
+            files,lastmod = snow_grains.utilities.lpdaac_list(URL,
+                build=False, pattern=file_pattern, sort=True)
+            # create mosaic for day
+            mosaic = np.ma.zeros((ny,nx))
+            mosaic.mask = np.ones((ny,nx),dtype=np.bool)
+            mosaic.count = np.zeros((ny,nx),dtype=np.uint32)
             for f in files:
                 # download netCDF4 bytes into memory
-                fileurl = [*OPENDAP,'MCD19A1',Y,D,'{0}.nc?{1}'.format(f,vars)]
-                remote_buffer = snow_grains.utilities.from_lpdaac(fileurl,
-                    build=False, verbose=VERBOSE)
+                fileurl = [*OPENDAP,'MCD19A1',YR,D,'{0}.nc?{1}'.format(f,vars)]
+                # attempt to retrieve bytes from OpenDAP
+                try:
+                    remote_buffer = snow_grains.utilities.from_lpdaac(fileurl,
+                        build=False, timeout=3600, verbose=VERBOSE)
+                except:
+                    continue
                 # read MODIS netCDF4 file from OpenDAP
                 X,Y,GPS,SGS,crs = read_MODIS_netCDF4(remote_buffer)
+                # create grid x and y
+                xgrid,ygrid = np.meshgrid(X,Y)
+                # create transformer for converting from MODIS Sinusoidal
+                # to output mosaic projection
+                trans = pyproj.Transformer.from_crs(crs1, crs, always_xy=True)
+                # convert grid coordinates to output mosaic projection
+                xproj,yproj = trans.transform(xgrid,ygrid)
+                # for each time step
+                for indt,t in enumerate(GPS):
+                    # use only valid data points within the boundary
+                    valid_count = np.count_nonzero((~SGS.mask[indt,:,:]) &
+                        (xgrid >= BOUNDS[0]) & (xgrid <= BOUNDS[2]) &
+                        (ygrid >= BOUNDS[1]) & (ygrid <= BOUNDS[3]))
+                    if (valid_count > 0):
+                        indy,indx, = np.nonzero((~SGS.mask[indt,:,:]) &
+                            (xgrid >= BOUNDS[0]) & (xgrid <= BOUNDS[2]) &
+                            (ygrid >= BOUNDS[1]) & (ygrid <= BOUNDS[3]))
+                        # regrid valid points to raster
+                        xvalid = xgrid[indy,indx]
+                        yvalid = ygrid[indy,indx]
+                        ii = np.array((xvalid - BOUNDS[0])/SPACING[0],dtype='i')
+                        jj = np.array((BOUNDS[3] - yvalid)/SPACING[1],dtype='i')
+                        mosaic.data[ii,jj] += SGS.data[indt,indy,indx]
+                        mosaic.mask[ii,jj] = False
+                        mosaic.count[ii,jj] += 1
+            # check if there are any valid points
+            if np.any(~mosaic.mask):
+                # convert from total to mean
+                ii,jj = np.nonzero(mosaic.count > 0)
+                mosaic.data[ii,jj] /= mosaic.count[ii,jj].astype(np.float)
+                # convert invalid to fill value
+                ii,jj = np.nonzero(mosaic.mask)
+                mosaic.data[ii,jj] = SGS.fill_value
+                # output mosaic to geotiff file
+                T = datetime.datetime.strptime(YR+D,'%Y%j').strftime('%Y_%m_%d')
+                mosaic_file = '{0}{1}_{2}.tif'.format('MCD19A1','_MOSAIC',T)
+                count_file = '{0}{1}_{2}.tif'.format('MCD19A1','_COUNT',T)
+                print(os.path.join(DIRECTORY,geotiff_file)) if VERBOSE else None
+                create_geotiff(os.path.join(DIRECTORY,geotiff_file),mosaic.data,
+                    geotransform,wkt,osgeo.gdal.GDT_Float64,SGS.fill_value)
+                create_geotiff(os.path.join(DIRECTORY,count_file),mosaic.count,
+                    geotransform,wkt,osgeo.gdal.GDT_UInt32,0)
+                # change the permissions mode
+                os.chmod(os.path.join(DIRECTORY,mosaic_file), MODE)
+                os.chmod(os.path.join(DIRECTORY,count_file), MODE)
 
 # PURPOSE: read MODIS HDF4 file and extract snow grain size
 def read_MODIS_HDF4(filename):
@@ -194,8 +300,8 @@ def read_MODIS_netCDF4(filename):
     crs = pyproj.CRS.from_string(proj_string.format(**kwds))
 
     # construct X and Y coordinates
-    X = fileID.variables['XDim']
-    Y = fileID.variables['YDim']
+    X = fileID.variables['XDim'][:]
+    Y = fileID.variables['YDim'][:]
 
     # extract time coordinates and convert to GPS time
     orbit_time_stamps = fileID.Orbit_time_stamp.split()
@@ -217,6 +323,28 @@ def read_MODIS_netCDF4(filename):
     fileID.close()
     # return the dimensions, snow grain size and coordinates
     return (X,Y,GPS,SGS,crs)
+
+# PURPOSE: create an output geotiff file for an input image and coordinates
+def create_geotiff(output_geotiff,data,geotransform,wkt,dtype,fill_value):
+    # grid shape
+    NY,NX = np.shape(data)
+    # output as geotiff
+    driver = osgeo.gdal.GetDriverByName("GTiff")
+    # set up the dataset with compression options (1 is for band 1)
+    ds = driver.Create(output_geotiff,NX,NY,1,dtype,['COMPRESS=LZW'])
+    # top left x, w-e pixel resolution, rotation
+    # top left y, rotation, n-s pixel resolution
+    ds.SetGeoTransform(geotransform)
+    # set the spatial projeciton reference info
+    srs = osgeo.osr.SpatialReference()
+    srs.ImportFromWkt(wkt)
+    # export
+    ds.SetProjection( srs.ExportToWkt() )
+    # set fill value
+    ds.GetRasterBand(1).SetNoDataValue(fill_value)
+    # write to geotiff array
+    ds.GetRasterBand(1).WriteArray(data)
+    ds.FlushCache()
 
 def main():
     # Read the system arguments listed after the program
@@ -244,7 +372,7 @@ def main():
         help='Years to run')
     # mosaic spatial parameters
     parser.add_argument('--bounds','-B',
-        type=float, nargs=4, metavar=('xmin','xmax','ymin','ymax'),
+        type=float, nargs=4, metavar=('xmin','ymin','xmax','ymax'),
         help='Grid bounds')
     parser.add_argument('--spacing','-S',
         type=float, nargs=2, metavar=('dx','dy'),
@@ -283,7 +411,7 @@ def main():
     if not os.access(args.directory, os.F_OK):
         os.makedirs(args.directory, args.mode)
 
-    #-- check internet connection before attempting to run program
+    # check internet connection before attempting to run program
     if snow_grains.utilities.check_connection('https://lpdaac.usgs.gov'):
         # run program with parameters
         modis_snow_grain_mosaic(args.directory, YEARS=args.year,

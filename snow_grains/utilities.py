@@ -18,6 +18,7 @@ import json
 import netrc
 import shutil
 import base64
+import inspect
 import hashlib
 import datetime
 import posixpath
@@ -27,6 +28,23 @@ if sys.version_info[0] == 2:
 else:
     from http.cookiejar import CookieJar
     import urllib.request as urllib2
+
+def get_data_path(relpath):
+    """
+    Get the absolute path within a package from a relative path
+
+    Arguments
+    ---------
+    relpath: relative path
+    """
+    #-- current file path
+    filename = inspect.getframeinfo(inspect.currentframe()).filename
+    filepath = os.path.dirname(os.path.abspath(filename))
+    if isinstance(relpath,list):
+        #-- use *splat operator to extract from list
+        return os.path.join(filepath,*relpath)
+    elif isinstance(relpath,str):
+        return os.path.join(filepath,relpath)
 
 #-- PURPOSE: recursively split a url path
 def url_split(s):
@@ -306,6 +324,9 @@ def from_lpdaac(HOST,username=None,password=None,build=True,timeout=None,
                 shutil.copyfileobj(remote_buffer, f, chunk)
             #-- change the permissions mode
             os.chmod(local,mode)
+        elif verbose and not local:
+            #-- print url information
+            print('{0}'.format(posixpath.join(*HOST)))
         #-- return the bytesIO object
         remote_buffer.seek(0)
         return remote_buffer
